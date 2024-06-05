@@ -1,0 +1,4 @@
+---
+- import_playbook: common.yml
+- import_playbook: gitlab_ce.yml
+- import_playbook: post_configure.yml

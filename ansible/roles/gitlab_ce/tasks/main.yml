@@ -1,0 +1,246 @@
+---
+
+# - name: Non Omnibus database related tasks
+#   block:
+#     - name: Add PostgreSQL repository to apt sources
+#       ansible.builtin.shell: echo "deb https://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+
+#     - name: Import PostgreSQL repository signing key
+#       ansible.builtin.shell: wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+
+#     - name: Update apt cache
+#       ansible.builtin.apt:
+#         update_cache: true
+
+#     - name: Install PostgreSQL and related packages
+#       ansible.builtin.apt:
+#         name: "{{ item }}"
+#         state: present
+#         update_cache: yes
+#       loop:
+#         - postgresql-{{ postgres_version }}
+#         - postgresql-client-{{ postgres_version }}
+#         - libpq-dev
+#         - postgresql-contrib-{{ postgres_version }}
+
+#     - name: Adjust PostgreSQL configuration
+#       lineinfile:
+#         path: /etc/postgresql/{{ postgres_version }}/main/postgresql.conf
+#         regexp: '^#?listen_addresses = .*'
+#         line: listen_addresses = '{{ postgres_listen_address }}'
+
+#     - name: Allow remote connections in pg_hba.conf
+#       lineinfile:
+#         path: /etc/postgresql/{{ postgres_version }}/main/pg_hba.conf
+#         regexp: '^host    all             all                          md5'
+#         line: 'host    all             all             {{ allowed_network }}             md5'
+
+#     - name: Start PostgreSQL service
+#       ansible.builtin.service:
+#         name: postgresql
+#         state: started
+
+#     - name: Enable PostgreSQL service
+#       ansible.builtin.service:
+#         name: postgresql
+#         enabled: yes
+
+#     - name: Create Database User
+#       community.postgresql.postgresql_user:
+#         login_host: "{{ postgres_host }}"
+#         login_port: "{{ postgres_port }}"
+# #        login_user: "{{ postgres_admin_username }}"
+#         login_password: "{{ postgres_admin_password }}"
+#         db: "template1"
+#         name: "{{ postgres_username.split('@')[0] }}"
+#         password: "{{ postgres_password }}"
+#         role_attr_flags: CREATEDB
+#         expires: infinity
+
+#     - name: Create Database
+#       community.postgresql.postgresql_db:
+#         login_host: "{{ postgres_host }}"
+#         login_port: "{{ postgres_port }}"
+#         login_user: "{{ postgres_username }}"
+#         login_password: "{{ postgres_password }}"
+#         name: "{{ postgres_database_name }}"
+#         encoding: UTF-8
+
+#     - name: Enable required Postgres extensions
+#       community.postgresql.postgresql_ext:
+#         login_host: "{{ postgres_host }}"
+#         login_port: "{{ postgres_port }}"
+# #        login_user: "{{ postgres_admin_username }}"
+#         login_password: "{{ postgres_admin_password }}"
+#         name: "{{ item }}"
+#         db: "{{ postgres_database_name }}"
+#       loop: ['pg_trgm', 'btree_gist', 'plpgsql', 'pg_stat_statements']
+#   when:
+#     - postgres_external_prep
+#   tags:
+#     - reconfigure
+#     - db_migrate
+#     - postgres_external
+
+- name: Propagate Secrets if existing
+  include_role:
+    name: common
+    tasks_from: secrets
+  tags:
+    - reconfigure
+    - secrets
+    - gitlab-secrets
+
+- name: Setup all GitLab Rails config files
+  template:
+    src: templates/gitlab-rails.gitlab.rb.j2
+    dest: /etc/gitlab/gitlab.rb
+  register: result
+  retries: 3
+  until: result is success
+  tags: reconfigure
+
+- name:  Configure GitLab Community Edition
+  command: gitlab-ctl reconfigure
+  tags: reconfigure
+
+- name: Propagate Secrets if new or changed
+  include_role:
+    name: common
+    tasks_from: secrets
+  vars:
+    gitlab_secrets_post_reconfigure: true
+  when: gitlab_secrets_setup
+  tags:
+    - reconfigure
+    - secrets
+    - gitlab-secrets
+
+- name: Propagate SSH Keys
+  block:
+    - name: Set up temp folder on local
+      tempfile:
+        state: directory
+        prefix: "gitlab-environment-toolkit-"
+      register: ssh_temp_folder
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Find all SSH host keys on primary Rails node
+      ansible.builtin.find:
+        paths: "{{ gitlab_shell_ssh_key_path }}/"
+        patterns: 'ssh_host_*'
+      register: ssh_host_keys
+
+    - name: Fetch all SSH host keys from primary Rails node to local
+      fetch:
+        src: "{{ item.path }}"
+        dest: "{{ ssh_temp_folder.path }}/"
+        flat: true
+      with_items: "{{ ssh_host_keys.files }}"
+      no_log: true
+
+    - name: Copy all SSH host keys to secondary Rails nodes
+      copy:
+        src: "{{ item }}"
+        dest: "{{ gitlab_shell_ssh_key_path }}"
+      with_fileglob: "{{ ssh_temp_folder.path }}/ssh_host_*"
+      no_log: true
+
+    - name: Remove temp folder
+      file:
+        path: "{{ ssh_temp_folder.path }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      run_once: true
+  tags:
+    - reconfigure
+    - secrets
+    - ssh_keys
+
+- name: Configure SSH
+  block:
+    - name: Configure SSH Fast Lookup if OpenSSH service being used
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+        block: |
+          Match User git   # Apply the AuthorizedKeysCommands to the git user only
+            AuthorizedKeysCommand /opt/gitlab/embedded/service/gitlab-shell/bin/gitlab-shell-authorized-keys-check git %u %k
+            AuthorizedKeysCommandUser git
+          Match all        # End match, settings apply to all users again
+        state: "{{ 'present' if gitlab_shell_ssh_daemon == 'openssh' else 'absent' }}"
+
+    - name: Reload OpenSSH service if being used
+      service:
+        name: "{{ 'sshd' if ansible_facts['os_family'] == 'RedHat' else 'ssh' }}"
+        state: reloaded
+      when: gitlab_shell_ssh_daemon == 'openssh'
+  tags:
+    - reconfigure
+    - secrets
+    - ssh_keys
+
+- name: Restart GitLab
+  command: gitlab-ctl restart
+  register: result
+  retries: 2
+  until: result is success
+  tags:
+    - reconfigure
+    - restart
+  
+# https://docs.gitlab.com/ee/administration/job_logs.html#enable-or-disable-incremental-logging
+- name: Enable Incremental Logging (Object Storage)
+  command: "gitlab-rails runner 'Feature.enable(:ci_enable_live_trace)'"
+  tags: reconfigure
+  when:
+    - gitlab_object_storage_type == 'object_storage'
+
+- name: Create skip-auto-reconfigure file
+  file:
+    path: /etc/gitlab/skip-auto-reconfigure
+    state: touch
+    mode: u=rw,g=r,o=r
+
+- name: Propagate Secrets if new or changed
+  include_role:
+    name: common
+    tasks_from: secrets
+  vars:
+    gitlab_secrets_post_reconfigure: false
+  when: gitlab_secrets_setup
+  tags:
+    - reconfigure
+    - secrets
+    - gitlab-secrets
+
+- name: Restart Monitor
+  shell: |
+    gitlab-ctl stop
+    pkill -f "/opt/gitlab/embedded/bin/prometheus[[:alnum:][:space:]\-]+" || echo "Prometheus is already stopped"
+    gitlab-ctl start
+  register: result
+  retries: 2
+  until: result is success
+  tags:
+    - reconfigure
+    - restart
+    - dashboards
+
+- name: Create skip-auto-reconfigure file
+  file:
+    path: /etc/gitlab/skip-auto-reconfigure
+    state: touch
+    mode: u=rw,g=r,o=r
+
+# Create a Website in Nginx if it is installed
+# - name: Check if Nginx is installed
+#   stat:
+#     path: /etc/nginx
+#   register: nginx
+
+# - include_tasks: nginx.yml
+#   when: nginx.stat.exists

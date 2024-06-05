@@ -1,0 +1,63 @@
+---
+- name: Install prerequisites
+  package:
+    name: dnsutils
+    state: latest
+
+- name: Change port of Gitlab-CE
+  lineinfile:
+    path: /etc/gitlab/gitlab.rb
+    regexp: '^external_url'
+    backrefs: yes
+    line: "external_url 'http://127.0.0.1:{{ gitlab_port }}'"
+    state: present
+  register: gitlabport
+
+- name: Reconfigure Gitlab-CE
+  command: gitlab-ctl reconfigure
+  when: gitlabport|changed
+
+- name: Create site in Nginx
+  template:
+    src: gitlab-ce.conf
+    dest: /etc/nginx/sites-available/{{ gitlab_hostname }}.conf
+    force: no
+
+- name:  Enable the site in Nginx
+  file:
+    src: /etc/nginx/sites-available/{{ gitlab_hostname }}.conf
+    path: /etc/nginx/sites-enabled/{{ gitlab_hostname }}.conf
+    state: link
+  notify: reload nginx
+
+- name:  Stop Nginx to generate certificate
+  service:
+    name: nginx
+    state: stopped
+  changed_when: false
+
+- name:  Make sure Certbot is installed
+  package:
+    name: certbot
+    state: latest
+
+- name:  Check if the GITLAB-CE hostname can be solved
+  command: dig {{ gitlab_hostname }} +short
+  register: dig
+  changed_when: false
+
+- name:  Generate certificate for GITLAB-CE
+  command: "certbot certonly -n -d {{ gitlab_hostname }} --agree-tos --standalone --email {{ certbot_email }}"
+  register: certbot
+  when: not dig.stdout == ""
+
+- name:  Check if Let's Encrypt certificates exist
+  stat:
+    path: /etc/letsencrypt/live/{{ gitlab_hostname }}/fullchain.pem
+  register: cert
+
+- name:  Start Nginx
+  service:
+    name: nginx
+    state: started
+  changed_when: false

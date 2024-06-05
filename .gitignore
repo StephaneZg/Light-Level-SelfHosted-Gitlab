@@ -1,0 +1,4 @@
+.vscode/*
+terraform/.terraform/*
+terraform/gitlab-key-pair.pem
+get-python-env/*

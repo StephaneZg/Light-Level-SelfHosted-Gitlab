@@ -1,0 +1,7 @@
+---
+- import_playbook: playbook_prep.yml
+
+- hosts: gitlab-main-instance
+  become: true
+  roles:
+    - gitlab_ce

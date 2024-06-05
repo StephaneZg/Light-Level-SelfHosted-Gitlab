@@ -1,0 +1,17 @@
+namespace: "gitlab"
+name: "low_level_selfhosted_gitlab"
+version: "3.2.2"
+readme: "../README.md"
+description: |
+  this is my selfhosted git config files based on Gitlab Environment Toolkit collection.
+authors:
+    - "Stephane Zang Bengono"
+dependencies:
+    "amazon.aws": ">=5.0"
+    "community.aws": ">=5.0"
+    "kubernetes.core": ">=2.0"
+tags:
+    - gitlab
+    - selfhosted-gitlab
+    - application
+repository: "https://gitlab.com/gitlab-org/gitlab-environment-toolkit"
